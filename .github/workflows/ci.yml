@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Lint, typecheck, test, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Reads the pnpm version from package.json "packageManager".
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          # Single source of truth for the Node version; see also .node-version.
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint and format check
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Check the committed JSON Schema matches the Zod schema
+        # The creator's editor autocomplete comes from chai.schema.json (ADR-030); if
+        # it drifts from src/config/schema.ts it starts lying. This regenerates and
+        # diffs, failing when the committed file is stale.
+        run: pnpm check:schema
+
+      - name: Test with coverage
+        # Enforces 100% branch coverage on the UPI builder and the config validator.
+        run: pnpm test:coverage
+        env:
+          # Unlocks the assertions that describe the *template's own example* config
+          # (ADR-037) — its presets, branding and placeholder VPA. They are skipped
+          # everywhere else, because a creator's repo runs this same suite and their
+          # config is, correctly, no longer the example.
+          CHAI_CANONICAL: ${{ github.repository == 'ShivamS136/buy-me-a-chai' && '1' || '' }}
+
+      - name: Validate the example config
+        run: pnpm check:config
+
+      - name: Build (Vercel / custom-domain layout)
+        run: pnpm build
+
+      - name: Assert a disabled build ships no analytics bytes
+        # Canonical only (ADR-037): this asserts a property of the *example* config,
+        # which declares no analytics. A creator who enables PostHog ships that chunk
+        # on purpose, and would otherwise fail their own CI for configuring the
+        # product correctly.
+        if: github.repository == 'ShivamS136/buy-me-a-chai'
+        # Hard rule 4 says a disabled build makes no network calls; ADR-028 goes
+        # further and says the code is not even there. The example config declares no
+        # `analytics` block, so `__CHAI_ANALYTICS__` folds to false and Rollup drops
+        # the whole PostHog chunk. That only holds while `import()` stays lexically
+        # inside the flag's branch in src/analytics/index.ts — a refactor that hoists
+        # it still passes every unit test and silently ships ~220 kB to every fork.
+        # This step is the only thing that notices.
+        run: |
+          if grep -rl 'disable_session_recording\|__PosthogExtensions__' dist/; then
+            echo "::error::dist/ contains PostHog bytes, but chai.config.ts declares no analytics block."
+            echo "See ADR-028 and the note above the ternary in src/analytics/index.ts."
+            exit 1
+          fi
+          echo "✓ no analytics bytes in a disabled build"
+
+      - name: Build on a GitHub Pages subpath
+        # Hard rule 7: every asset path must respect Vite `base`. Building the
+        # subpath layout in CI is what stops an absolute path shipping.
+        run: BASE_PATH=/buy-me-a-chai/ pnpm build
+
+      - name: Assert subpath assets are actually rewritten
+        run: |
+          if ! grep -q 'src="/buy-me-a-chai/assets/' dist/index.html; then
+            echo "::error::dist/index.html does not reference the /buy-me-a-chai/ subpath."
+            echo "Emitted asset references were:"
+            grep -o 'src="[^"]*"\|href="[^"]*"' dist/index.html || true
+            exit 1
+          fi
+          echo "✓ assets are rewritten under the Pages subpath"
+
+      - name: Assert the social card is absolute and actually exists
+        # Canonical only (ADR-037, ADR-043). This asserts against *this repo's* example
+        # config and its own subpath, so in a creator's fork it tested their content
+        # against our expectations and went red for it — which is how it broke the first
+        # real fork the day it merged.
+        #
+        # The head-injection path has no unit test — vite.config.ts is outside the
+        # coverage include — and a typo'd ogImage produces no Vite warning at all,
+        # so the card would silently 404 in every link preview. Crawlers need an
+        # absolute URL (Meta's WhatsApp doc is explicit), which needs SITE_URL.
+        if: github.repository == 'ShivamS136/buy-me-a-chai'
+        run: |
+          SITE_URL=https://example.github.io BASE_PATH=/buy-me-a-chai/ pnpm build
+          for tag in \
+            'og:image" content="https://example.github.io/buy-me-a-chai/og.png' \
+            'og:url" content="https://example.github.io/buy-me-a-chai/' \
+            'twitter:card" content="summary_large_image'
+          do
+            if ! grep -qF "$tag" dist/index.html; then
+              echo "::error::dist/index.html is missing: $tag"
+              grep -oE '<meta (property|name)="(og|twitter):[^>]*>' dist/index.html || true
+              exit 1
+            fi
+          done
+          test -f dist/og.png || { echo "::error::dist/og.png was not emitted."; exit 1; }
+          echo "✓ social card is absolute, declared and shipped"
+
+      - name: Assert a config with no ogImage line still gets a card
+        # The rule that repairs every repo made before ADR-040: no `meta.ogImage`, but
+        # `public/og.png` on disk, must still emit the card. That is the exact shape of
+        # every existing fork's config, and nothing else in the suite has that shape —
+        # this repo's own example sets the line explicitly.
+        if: github.repository == 'ShivamS136/buy-me-a-chai'
+        run: |
+          cp chai.config.yaml "$RUNNER_TEMP/chai.config.yaml.bak"
+          trap 'cp "$RUNNER_TEMP/chai.config.yaml.bak" chai.config.yaml' EXIT
+          grep -q '^  ogImage:' chai.config.yaml || {
+            echo "::error::The example config no longer has an ogImage line to remove — this test is testing nothing."; exit 1; }
+          # Filtered out of the backup rather than edited in place: `sed -i` takes its
+          # backup suffix differently on GNU and BSD, and this file must come back exactly.
+          grep -v '^  ogImage:' "$RUNNER_TEMP/chai.config.yaml.bak" > chai.config.yaml
+          SITE_URL=https://example.github.io BASE_PATH=/buy-me-a-chai/ pnpm build
+          for tag in \
+            'og:image" content="https://example.github.io/buy-me-a-chai/og.png' \
+            'twitter:card" content="summary_large_image'
+          do
+            if ! grep -qF "$tag" dist/index.html; then
+              echo "::error::A config without ogImage lost its card — every pre-ADR-040 fork just went back to a bare text link. Missing: $tag"
+              exit 1
+            fi
+          done
+          echo "✓ the card defaults to /og.png with no config line"
+
+      - name: Assert the placeholder guard rejects the shipped example
+        # Canonical only (ADR-037): a creator replaces the example, so `check:placeholder`
+        # correctly exits 0 in their repo and this negative test would invert into a
+        # permanent red CI for having onboarded successfully.
+        if: github.repository == 'ShivamS136/buy-me-a-chai'
+        # A NEGATIVE test, and the point of the whole guard. This repo ships an
+        # example config with `yourname@bank`, which is a valid VPA *format* and so
+        # passes the schema on purpose. If this step ever succeeds, the guard has
+        # stopped protecting forks from deploying a page that points at nobody.
+        run: |
+          if pnpm check:placeholder; then
+            echo "::error::check:placeholder accepted the shipped example config — the deploy guard is broken."
+            exit 1
+          fi
+          echo "✓ the guard correctly refuses to deploy the example config"
